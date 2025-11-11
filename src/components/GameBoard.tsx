@@ -145,11 +145,15 @@ export const GameBoard = () => {
   const requestUpgrade = useGameStore((state) => state.requestUpgrade);
   const mortgageProperty = useGameStore((state) => state.mortgageProperty);
   const redeemProperty = useGameStore((state) => state.redeemProperty);
+  const leaveJailByPayment = useGameStore((state) => state.leaveJailByPayment);
+  const useJailCard = useGameStore((state) => state.useJailCard);
+  const claimPledgeFrom = useGameStore((state) => state.claimPledgeFrom);
   const pendingTrade = useGameStore((state) => state.pendingTrade);
   const sendTradeProposal = useGameStore((state) => state.sendTradeProposal);
   const acceptTradeProposal = useGameStore((state) => state.acceptTradeProposal);
   const rejectTradeProposal = useGameStore((state) => state.rejectTradeProposal);
   const lastMovementPath = useGameStore((state) => state.lastMovementPath);
+  const winnerId = useGameStore((state) => state.winnerId);
 
   const currency = t("currencySymbol");
   const [dieA, dieB] = lastRoll;
@@ -163,6 +167,7 @@ export const GameBoard = () => {
 
   const rentPreview = getRentPreview(activeTile ?? null, propertyState, currency);
   const movementSet = useMemo(() => new Set(lastMovementPath), [lastMovementPath]);
+  const finalMovementIndex = lastMovementPath.length > 0 ? lastMovementPath[lastMovementPath.length - 1] : null;
 
   const playersByArea = useMemo(() => {
     const mapping: Record<string, typeof players> = {};
@@ -253,8 +258,14 @@ export const GameBoard = () => {
   const [tradeOpen, setTradeOpen] = useState(false);
   const [eventsOpen, setEventsOpen] = useState(false);
   const [isRolling, setIsRolling] = useState(false);
+  const [pledgeOpen, setPledgeOpen] = useState(false);
+  const [pledgeTarget, setPledgeTarget] = useState("");
+  const [pledgeTile, setPledgeTile] = useState<string | null>(null);
   const rollingTimeout = useRef<number | null>(null);
   const isRollingRef = useRef(false);
+  const prevPlayersRef = useRef(players);
+  const [eliminationNotice, setEliminationNotice] = useState<string[] | null>(null);
+  const [winnerNotice, setWinnerNotice] = useState<string | null>(null);
 
   useEffect(() => {
     if (players.length === 0) {
@@ -302,7 +313,29 @@ export const GameBoard = () => {
       }
       isRollingRef.current = false;
     };
-  }, []);
+  }, [t]);
+
+  useEffect(() => {
+    const prev = prevPlayersRef.current;
+    if (prev !== players) {
+      const eliminated = prev.filter(
+        (prevPlayer) => !players.some((player) => player.id === prevPlayer.id),
+      );
+      if (eliminated.length > 0) {
+        setEliminationNotice(eliminated.map((player) => player.name));
+      }
+      prevPlayersRef.current = players;
+    }
+  }, [players]);
+
+  useEffect(() => {
+    if (!winnerId) {
+      setWinnerNotice(null);
+      return;
+    }
+    const winner = players.find((player) => player.id === winnerId);
+    setWinnerNotice(winner?.name ?? null);
+  }, [winnerId, players]);
 
   const tradeFromTiles = useMemo(() => {
     if (!tradeFrom) return [];
@@ -345,11 +378,17 @@ export const GameBoard = () => {
     const map: Record<string, string> = {};
     BOARD_TILES.forEach((tile) => {
       if (tile.id) {
-        map[tile.id] = tile.name;
+        map[tile.id] = t(`tiles.${tile.id}`, { defaultValue: tile.name });
       }
     });
     return map;
-  }, []);
+  }, [t]);
+
+  const tileLabel = (tile?: TileDefinition | null) => {
+    if (!tile) return "";
+    if (tile.id) return t(`tiles.${tile.id}`, { defaultValue: tile.name });
+    return tile.name ?? "";
+  };
 
   const tradeFromPlayer = players.find((player) => player.id === tradeFrom) ?? null;
   const tradeToPlayer = players.find((player) => player.id === tradeTo) ?? null;
@@ -514,8 +553,12 @@ export const GameBoard = () => {
       />
     );
 
-    const highlight = movementSet.has(boardIndex)
+    const isFinal = finalMovementIndex === boardIndex;
+    const isPassing = movementSet.has(boardIndex) && !isFinal;
+    const highlight = isFinal
       ? "ring-2 ring-primary/70 shadow-[0_0_15px_rgba(43,108,238,0.6)] animate-pulse"
+      : isPassing
+      ? "ring-1 ring-primary/30 shadow-[0_0_6px_rgba(43,108,238,0.15)]"
       : "";
 
     return (
@@ -527,7 +570,7 @@ export const GameBoard = () => {
         {isVertical ? colorStrip : null}
         <div className="flex flex-1 flex-col items-center justify-center gap-1 px-1 py-2">
           <p className="text-center text-[0.55rem] font-bold leading-tight text-white">
-            {tile.name}
+            {tileLabel(tile)}
           </p>
           <span className="text-[0.55rem] text-slate-400">
             {tile.group?.toUpperCase() ?? tile.type}
@@ -540,8 +583,12 @@ export const GameBoard = () => {
   };
 
   const renderSpecialTile = (tile: TileDefinition, area: string, boardIndex: number) => {
-    const highlight = movementSet.has(boardIndex)
+    const isFinal = finalMovementIndex === boardIndex;
+    const isPassing = movementSet.has(boardIndex) && !isFinal;
+    const highlight = isFinal
       ? "ring-2 ring-primary/70 shadow-[0_0_15px_rgba(43,108,238,0.6)] animate-pulse"
+      : isPassing
+      ? "ring-1 ring-primary/30 shadow-[0_0_6px_rgba(43,108,238,0.15)]"
       : "";
     return (
       <div
@@ -552,7 +599,7 @@ export const GameBoard = () => {
         <span className="material-symbols-outlined text-base text-primary">
           {tile.icon ?? tileIconDefaults[tile.type]}
         </span>
-        <span className="text-[0.55rem] text-white">{tile.name}</span>
+        <span className="text-[0.55rem] text-white">{tileLabel(tile)}</span>
         {renderTokenCluster(area)}
       </div>
     );
@@ -625,7 +672,7 @@ export const GameBoard = () => {
                   />
                   <div className="flex flex-1 flex-col">
                     <span className="text-sm font-bold leading-tight">{player.name}</span>
-                    <span className="text-xs text-slate-400">{tile?.name}</span>
+                    <span className="text-xs text-slate-400">{tileLabel(tile)}</span>
                   </div>
                   <span className="text-sm font-semibold">
                     {currencyFormatter(currency, player.funds)}
@@ -653,7 +700,7 @@ export const GameBoard = () => {
                             color: ownedTile.color ? "#fff" : "#cbd5f5",
                           }}
                         >
-                          {ownedTile.name}
+                          {tileLabel(ownedTile)}
                         </span>
                       ))}
                     </div>
@@ -727,7 +774,7 @@ export const GameBoard = () => {
                             ? t("purchasePromptTitle")
                             : t("upgradePromptTitle")}
                         </p>
-                        <h3 className="text-2xl font-bold text-white">{pendingTile.name}</h3>
+                        <h3 className="text-2xl font-bold text-white">{tileLabel(pendingTile)}</h3>
                         <p className="text-sm text-slate-300">
                           {pendingAction.type === "purchase"
                             ? t("purchasePromptDesc", {
@@ -830,6 +877,136 @@ export const GameBoard = () => {
                     </div>
                   </div>
                 )}
+              {eliminationNotice && (
+                <div className="pointer-events-auto absolute inset-0 z-30 flex items-center justify-center p-4">
+                  <div className="w-full max-w-md rounded-2xl border border-rose-400/40 bg-black/85 p-6 text-center shadow-2xl shadow-black/60 backdrop-blur">
+                    <p className="text-xs font-semibold uppercase tracking-[0.4em] text-rose-300">
+                      {t("eliminationTitle")}
+                    </p>
+                    <ul className="mt-4 space-y-1 text-lg font-bold text-white">
+                      {eliminationNotice.map((name) => (
+                        <li key={`elim-${name}`}>{name}</li>
+                      ))}
+                    </ul>
+                    <p className="mt-2 text-sm text-slate-300">{t("eliminationSubtitle")}</p>
+                    <button
+                      type="button"
+                      onClick={() => setEliminationNotice(null)}
+                      className="mt-6 inline-flex items-center justify-center rounded-lg bg-white/15 px-6 py-2 text-xs font-semibold uppercase tracking-[0.3em] text-white transition-colors hover:bg-white/25"
+                    >
+                      {t("eliminationDismiss")}
+                    </button>
+                  </div>
+                </div>
+              )}
+              {winnerNotice && (
+                <div className="pointer-events-auto absolute inset-0 z-50 flex items-center justify-center p-4">
+                  <div className="w-full max-w-md rounded-2xl border border-emerald-400/40 bg-black/85 p-6 text-center shadow-2xl shadow-black/60 backdrop-blur">
+                    <p className="text-xs font-semibold uppercase tracking-[0.4em] text-emerald-300">
+                      {t("winnerTitle")}
+                    </p>
+                    <p className="mt-4 text-3xl font-black text-white">{winnerNotice}</p>
+                    <p className="mt-2 text-sm text-slate-200">{t("winnerSubtitle")}</p>
+                    <button
+                      type="button"
+                      onClick={() => setWinnerNotice(null)}
+                      className="mt-6 inline-flex items-center justify-center rounded-lg bg-primary px-6 py-2 text-xs font-semibold uppercase tracking-[0.3em] text-white transition-colors hover:bg-primary/90"
+                    >
+                      {t("winnerDismiss")}
+                    </button>
+                  </div>
+                </div>
+              )}
+              {pledgeOpen && (
+                <div className="pointer-events-auto absolute inset-0 z-40 flex items-center justify-center p-4">
+                  <div className="w-full max-w-lg rounded-2xl border border-white/15 bg-black/80 p-5 text-left shadow-2xl shadow-black/60 backdrop-blur">
+                    <p className="text-xs font-semibold uppercase tracking-[0.4em] text-primary">Rehine Alma</p>
+                    <div className="mt-4 grid gap-3">
+                      <label className="flex flex-col gap-2 text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">
+                        Hedef Oyuncu
+                        <select
+                          className="rounded-lg border border-white/15 bg-black/30 px-3 py-2 text-sm text-white focus:border-primary focus:outline-none"
+                          value={pledgeTarget}
+                          onChange={(e) => {
+                            setPledgeTarget(e.target.value);
+                            setPledgeTile(null);
+                          }}
+                        >
+                          <option value="">Seçiniz</option>
+                          {players
+                            .filter((p) => p.id !== activePlayer?.id)
+                            .map((p) => (
+                              <option key={p.id} value={p.id}>
+                                {p.name}
+                              </option>
+                            ))}
+                        </select>
+                      </label>
+
+                      {pledgeTarget && (
+                        <div>
+                          <p className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">Mülkleri</p>
+                          <div className="mt-2 flex flex-wrap gap-2">
+                            {(ownershipMap[pledgeTarget] ?? []).length > 0 ? (
+                              (ownershipMap[pledgeTarget] ?? []).map((tile) => {
+                                const selected = pledgeTile === tile.id;
+                                return (
+                                  <button
+                                    key={`pledge-${tile.id}`}
+                                    type="button"
+                                    onClick={() => setPledgeTile(tile.id)}
+                                    className={`rounded-full border px-3 py-1 text-[0.65rem] font-semibold transition-colors ${
+                                      selected
+                                        ? "border-primary bg-primary/20 text-white"
+                                        : "border-white/10 text-slate-300 hover:border-white/30"
+                                    }`}
+                                  >
+                                    {tileLabel(tile)}
+                                  </button>
+                                );
+                              })
+                            ) : (
+                              <span className="text-[0.65rem] text-slate-500">Mülk yok</span>
+                            )}
+                          </div>
+                        </div>
+                      )}
+
+                      <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                        <button
+                          type="button"
+                          disabled={!pledgeTarget || !pledgeTile}
+                          onClick={() => {
+                            if (!pledgeTarget || !pledgeTile) return;
+                            playSound("ui");
+                            claimPledgeFrom(pledgeTarget, pledgeTile);
+                            setPledgeOpen(false);
+                            setPledgeTarget("");
+                            setPledgeTile(null);
+                          }}
+                          className={`rounded-lg bg-primary px-4 py-3 text-sm font-bold uppercase tracking-[0.2em] text-white transition-colors ${
+                            !pledgeTarget || !pledgeTile ? "opacity-60 cursor-not-allowed" : "hover:bg-primary/90"
+                          }`}
+                        >
+                          Rehine Al
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            playSound("ui");
+                            setPledgeOpen(false);
+                            setPledgeTarget("");
+                            setPledgeTile(null);
+                          }}
+                          className="rounded-lg border border-white/15 px-4 py-3 text-sm font-semibold uppercase tracking-[0.2em] text-slate-200 transition-colors hover:bg-white/10"
+                        >
+                          İptal
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
 
               <div
                 className="board relative h-full w-full"
@@ -853,11 +1030,12 @@ export const GameBoard = () => {
                   )}
                 </div>
 
-                {areaTiles.map(({ area, tile, index }) => {
+                {areaTiles.map(({ area, tile }) => {
                   if (!tile) return null;
+                  const tileIndex = BOARD_TILES.indexOf(tile);
                   return tile.type === "property"
-                    ? renderPropertyTile(tile, area, getOrientation(area), index)
-                    : renderSpecialTile(tile, area, index);
+                    ? renderPropertyTile(tile, area, getOrientation(area), tileIndex)
+                    : renderSpecialTile(tile, area, tileIndex);
                 })}
               </div>
 
@@ -877,7 +1055,7 @@ export const GameBoard = () => {
               </p>
               <span className="text-xs text-slate-400">{rentPreview}</span>
             </div>
-            <h3 className="mt-2 text-xl font-bold leading-tight">{activeTile?.name}</h3>
+            <h3 className="mt-2 text-xl font-bold leading-tight">{tileLabel(activeTile)}</h3>
             <p className="text-sm text-slate-300">{activeTile?.description ?? ""}</p>
             <div className="mt-4 space-y-2 text-sm text-slate-300">
               <div className="flex items-center justify-between">
@@ -888,6 +1066,34 @@ export const GameBoard = () => {
                   {tileOwner?.name ?? t("tileFreeLabel")}
                 </span>
               </div>
+              {activePlayer?.inJail && (
+                <div className="mt-4 grid gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      playSound("ui");
+                      // pay 200 to leave jail
+                      leaveJailByPayment(activePlayer.id);
+                    }}
+                    className="w-full rounded-lg bg-amber-500 px-4 py-2 text-sm font-bold text-white"
+                  >
+                    {t("leaveJailPay", { price: `${currency} 200` })}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      playSound("ui");
+                      useJailCard(activePlayer.id);
+                    }}
+                    disabled={!activePlayer?.hasGetOutOfJail}
+                    className={`w-full rounded-lg px-4 py-2 text-sm font-semibold text-white ${
+                      activePlayer?.hasGetOutOfJail ? "bg-emerald-500" : "bg-white/5 text-slate-400"
+                    }`}
+                  >
+                    {t("useJailCard")}
+                  </button>
+                </div>
+              )}
               <div className="flex items-center justify-between">
                 <span className="text-xs uppercase tracking-[0.3em] text-slate-500">
                   {t("investmentLabel")}
@@ -990,6 +1196,14 @@ export const GameBoard = () => {
                     <span className="text-xs text-slate-300">
                       {canRedeem ? currencyFormatter(currency, redeemCost) : t("actionUnavailable")}
                     </span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setPledgeOpen(true)}
+                    className={`flex w-full flex-col rounded-xl border px-4 py-3 text-left transition-all bg-white/5 text-slate-200`}
+                  >
+                    <span className="text-sm font-semibold">Rehine Al</span>
+                    <span className="text-xs text-slate-300">Başkasının mülkünü rehine al</span>
                   </button>
                 </div>
               </>
@@ -1124,7 +1338,7 @@ export const GameBoard = () => {
                                   : "border-white/10 text-slate-300 hover:border-white/30"
                               }`}
                             >
-                              {tile.name}
+                              {tileLabel(tile)}
                             </button>
                           );
                         })
@@ -1152,7 +1366,7 @@ export const GameBoard = () => {
                                   : "border-white/10 text-slate-300 hover:border-white/30"
                               }`}
                             >
-                              {tile.name}
+                              {tileLabel(tile)}
                             </button>
                           );
                         })

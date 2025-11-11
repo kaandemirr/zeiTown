@@ -8,6 +8,7 @@ import {
   type TileDefinition,
 } from "../data/board";
 import { playSound } from "../lib/sound";
+import i18n from "../i18n/config";
 
 export type GamePhase = "lobby" | "setup" | "rolling" | "trading" | "summary";
 
@@ -86,6 +87,7 @@ interface GameState {
   pendingTrade: TradeProposal | null;
   auction: AuctionState | null;
   lastMovementPath: number[];
+  winnerId: string | null;
   addPlayer: (
     player: Omit<Player, "funds" | "position" | "inJail" | "jailTurns" | "hasGetOutOfJail">,
   ) => void;
@@ -95,6 +97,10 @@ interface GameState {
   ) => void;
   setPlayerCount: (count: number) => void;
   rollDiceAndResolve: () => void;
+  // dev helper (optional)
+  // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+  // @ts-ignore
+  rollDiceAndResolveFixed?: (a: number, b: number) => void;
   confirmPurchase: () => void;
   declinePurchase: () => void;
   confirmUpgrade: () => void;
@@ -102,6 +108,8 @@ interface GameState {
   requestUpgrade: (tileId: string) => void;
   mortgageProperty: (tileId: string) => void;
   redeemProperty: (tileId: string) => void;
+  // transfer a property from another player to the active player as a pledge
+  claimPledgeFrom: (fromPlayerId: string, tileId: string) => void;
   sendTradeProposal: (payload: Omit<TradeProposal, "id">) => boolean;
   acceptTradeProposal: () => boolean;
   rejectTradeProposal: (initiatorId?: string) => boolean;
@@ -167,10 +175,7 @@ const ownsFullSet = (
   if (!tile.group) return false;
   const groupTiles = BOARD_TILES.filter((t) => t.group === tile.group);
   return groupTiles.every(
-    (groupTile) =>
-      groupTile.id &&
-      propertyState[groupTile.id] &&
-      propertyState[groupTile.id].ownerId === ownerId,
+    (groupTile) => groupTile.id && propertyState[groupTile.id] && propertyState[groupTile.id].ownerId === ownerId,
   );
 };
 
@@ -181,10 +186,7 @@ const countOwnedInGroup = (
 ) => {
   if (!tile.group) return 0;
   return BOARD_TILES.filter(
-    (t) =>
-      t.group === tile.group &&
-      t.id &&
-      propertyState[t.id]?.ownerId === ownerId,
+    (t) => t.group === tile.group && t.id && propertyState[t.id]?.ownerId === ownerId,
   ).length;
 };
 
@@ -207,6 +209,9 @@ const computeForwardPath = (start: number, target: number) => {
   const steps = (target - start + length) % length;
   return computeMovementPath(start, steps);
 };
+
+const computeWinnerId = (players: Player[]): string | null =>
+  players.length === 1 ? players[0].id : null;
 
 const calculateRent = (
   tile: TileDefinition,
@@ -258,6 +263,12 @@ const getMortgageValue = (tile: TileDefinition) => {
   return tile.mortgage ?? Math.round((tile.price ?? 0) / 2);
 };
 
+const determineUpgradeCost = (tile: TileDefinition | null, nextLevel: number) => {
+  if (!tile || !tile.houseCost) return 0;
+  if (nextLevel <= 4) return tile.houseCost;
+  return tile.houseCost * 2;
+};
+
 type PaymentOutcome = {
   players: Player[];
   propertyState: Record<string, PropertyState>;
@@ -279,9 +290,7 @@ const handleBankruptcy = (
   }
 
   const bankruptPlayer = players[index];
-  const creditor = creditorId
-    ? players.find((player) => player.id === creditorId) ?? null
-    : null;
+  const creditor = creditorId ? players.find((player) => player.id === creditorId) ?? null : null;
 
   const nextPropertyState = clonePropertyState(propertyState);
   for (const meta of Object.values(nextPropertyState)) {
@@ -298,8 +307,8 @@ const handleBankruptcy = (
 
   const resultPlayers = players.filter((_, idx) => idx !== index);
   const message = creditor
-    ? `${bankruptPlayer.name} transferred all assets to ${creditor.name} and left the city.`
-    : `${bankruptPlayer.name} filed for bankruptcy and returned assets to the municipality.`;
+    ? i18n.t("logs.bankrupted_to_creditor", { bankrupt: bankruptPlayer.name, creditor: creditor.name })
+    : i18n.t("logs.bankrupted_municipality", { bankrupt: bankruptPlayer.name });
   const nextLogs = addLog(logs, message);
 
   return {
@@ -376,26 +385,30 @@ const resolveJailState = (
     return { canMove: true, players, propertyState, logs, removedIndex: null };
   }
 
+  // use-out-of-jail card
   if (player.hasGetOutOfJail) {
     player.hasGetOutOfJail = false;
     player.inJail = false;
     player.jailTurns = 0;
-    const nextLogs = addLog(logs, `${player.name} used a release permit.`);
+    const nextLogs = addLog(logs, i18n.t("logs.used_release", { name: player.name }));
     return { canMove: true, players, propertyState, logs: nextLogs, removedIndex: null };
   }
 
+  // rolled doubles
   if (dieA === dieB) {
     player.inJail = false;
     player.jailTurns = 0;
-    const nextLogs = addLog(logs, `${player.name} rolled doubles and left city hall.`);
+    const nextLogs = addLog(logs, i18n.t("logs.rolled_doubles_left", { name: player.name }));
     return { canMove: true, players, propertyState, logs: nextLogs, removedIndex: null };
   }
 
+  // else increment jail turns
   player.jailTurns += 1;
-  let nextLogs = addLog(logs, `${player.name} waits in city hall (${player.jailTurns}/${MAX_JAIL_TURNS}).`);
+  let nextLogs = addLog(logs, i18n.t("logs.waits_in_jail", { name: player.name, current: player.jailTurns, max: MAX_JAIL_TURNS }));
 
   if (player.jailTurns >= MAX_JAIL_TURNS) {
-    const result = payAmount(players, propertyState, player.id, null, 50, nextLogs);
+    // Player must pay 200 to get out after MAX_JAIL_TURNS
+    const result = payAmount(players, propertyState, player.id, null, 200, nextLogs);
     const updatedPlayers = result.players;
     const updatedPropertyState = result.propertyState;
 
@@ -415,7 +428,7 @@ const resolveJailState = (
       holder.jailTurns = 0;
     }
 
-    nextLogs = addLog(result.logs, `${player.name} paid ${formatFunds(50)} to exit city hall.`);
+  nextLogs = addLog(result.logs, i18n.t("logs.paid_exit", { name: player.name, amount: formatFunds(200) }));
     return {
       canMove: true,
       players: updatedPlayers,
@@ -441,14 +454,16 @@ const handleChanceOrChest = (
   followUpPosition: number | null;
   movementPath: number[];
 } => {
-  let nextLogs = addLog(logs, card.title);
+  const keyType = card.id && card.id.startsWith("chance-") ? "chance" : card.id && card.id.startsWith("chest-") ? "chest" : "chance";
+  const localizedCardTitle = i18n.t(`cards.${keyType}.${card.id}.title`, { defaultValue: card.title });
+  let nextLogs = addLog(logs, localizedCardTitle);
   let followUpPosition: number | null = null;
   let movementPath: number[] = [];
 
   switch (card.effect.action) {
     case "collect":
       player.funds += card.effect.amount;
-      nextLogs = addLog(nextLogs, `${player.name} received ${formatFunds(card.effect.amount)}.`);
+  nextLogs = addLog(nextLogs, i18n.t("logs.received", { name: player.name, amount: formatFunds(card.effect.amount) }));
       break;
     case "pay": {
       const result = payAmount(players, propertyState, player.id, null, card.effect.amount, nextLogs);
@@ -465,7 +480,7 @@ const handleChanceOrChest = (
       player.position = normalizePosition(card.effect.target);
       movementPath = computeForwardPath(previous, player.position);
       if (applyPassStartBonus(player, previous, player.position, true)) {
-        nextLogs = addLog(nextLogs, `${player.name} collected ${formatFunds(PASS_START_BONUS)} at City Gate.`);
+        nextLogs = addLog(nextLogs, i18n.t("logs.collected_start", { name: player.name, amount: formatFunds(PASS_START_BONUS) }));
       }
       followUpPosition = player.position;
       break;
@@ -515,11 +530,11 @@ const handleChanceOrChest = (
     }
     case "get-out-of-jail":
       player.hasGetOutOfJail = true;
-      nextLogs = addLog(nextLogs, `${player.name} received a release permit.`);
+  nextLogs = addLog(nextLogs, i18n.t("logs.received_release", { name: player.name }));
       break;
     case "go-to-jail":
       sendPlayerToJail(player);
-      nextLogs = addLog(nextLogs, `${player.name} was escorted to city hall.`);
+  nextLogs = addLog(nextLogs, i18n.t("logs.redirected_to_city_hall", { name: player.name }));
       break;
     case "luck-check": {
       const diceA = rollDie();
@@ -549,10 +564,13 @@ const handleChanceOrChest = (
   return { players, propertyState, logs: nextLogs, followUpPosition, movementPath };
 };
 
-const determineUpgradeCost = (tile: TileDefinition, nextLevel: number) => {
-  if (!tile.houseCost) return 0;
-  if (nextLevel <= 4) return tile.houseCost;
-  return tile.houseCost * 2;
+const collapseConsecutiveDuplicates = (path: number[]) => {
+  if (!path || path.length === 0) return path;
+  const out: number[] = [path[0]];
+  for (let i = 1; i < path.length; i += 1) {
+    if (path[i] !== path[i - 1]) out.push(path[i]);
+  }
+  return out;
 };
 
 const getActiveTile = (player: Player) => BOARD_TILES[player.position] ?? BOARD_TILES[0];
@@ -574,6 +592,7 @@ export const useGameStore = create<GameState>((set) => ({
   pendingTrade: null,
   auction: null,
   lastMovementPath: [],
+  winnerId: null,
   addPlayer: (player) => {
     set((state) => ({
       players: [
@@ -624,268 +643,16 @@ export const useGameStore = create<GameState>((set) => ({
 
       const dieA = rollDie();
       const dieB = rollDie();
-      const diceTotal = dieA + dieB;
-
-      let players = state.players.map((player) => ({ ...player }));
-      let propertyState = clonePropertyState(state.propertyState);
-      let logs = state.logs;
-      let movementPath: number[] = [];
-
-      let currentIndex = state.currentTurnIndex;
-      if (currentIndex >= players.length) currentIndex = 0;
-      let activePlayer = players[currentIndex];
-      let pendingAction: PendingAction = null;
-      let pendingNextTurnIndex: number | null = null;
-      let consecutiveDoubles = dieA === dieB ? state.consecutiveDoubles + 1 : 0;
-      let stayOnCurrentPlayer = dieA === dieB;
-      let lastCard: CardSnapshot | null = null;
-      let chanceIndex = state.chanceIndex;
-      let chestIndex = state.chestIndex;
-
-      logs = addLog(logs, `${activePlayer.name} rolled ${dieA} + ${dieB}.`);
-
-      if (dieA === dieB && consecutiveDoubles >= 3) {
-        sendPlayerToJail(activePlayer);
-        logs = addLog(logs, `${activePlayer.name} rolled three doubles in a row and was audited.`);
-        consecutiveDoubles = 0;
-        stayOnCurrentPlayer = false;
-        const nextIndex = players.length > 0 ? (currentIndex + 1) % players.length : 0;
-        return {
-          ...state,
-          players,
-          propertyState,
-          lastRoll: [dieA, dieB],
-          logs,
-          currentTurnIndex: nextIndex,
-          consecutiveDoubles,
-          pendingAction: null,
-          pendingNextTurnIndex: null,
-          lastCard: null,
-          lastMovementPath: [],
-        };
-      }
-
-      const jailResult = resolveJailState(activePlayer, dieA, dieB, players, propertyState, logs);
-      players = jailResult.players;
-      propertyState = jailResult.propertyState;
-      logs = jailResult.logs;
-
-      if (jailResult.removedIndex !== null) {
-        if (jailResult.removedIndex < currentIndex) {
-          currentIndex -= 1;
-        } else if (jailResult.removedIndex === currentIndex) {
-          const nextIndex = players.length > 0 ? currentIndex % players.length : 0;
-          return {
-            ...state,
-            players,
-            propertyState,
-            logs,
-            lastRoll: [dieA, dieB],
-            currentTurnIndex: nextIndex,
-            consecutiveDoubles: 0,
-            pendingAction: null,
-            pendingNextTurnIndex: null,
-            lastCard: null,
-            lastMovementPath: [],
-          };
-        }
-      }
-
-      if (!jailResult.canMove) {
-        const nextIndex = players.length > 0 ? (currentIndex + 1) % players.length : 0;
-        return {
-          ...state,
-          players,
-          propertyState,
-          logs,
-          lastRoll: [dieA, dieB],
-          currentTurnIndex: nextIndex,
-          consecutiveDoubles: 0,
-          pendingAction: null,
-          pendingNextTurnIndex: null,
-          lastCard: null,
-          lastMovementPath: [],
-        };
-      }
-
-      activePlayer = players[currentIndex];
-
-      const previous = activePlayer.position;
-      const nextPosition = normalizePosition(previous + diceTotal);
-      const passedStart = applyPassStartBonus(activePlayer, previous, nextPosition, diceTotal > 0);
-      movementPath = computeMovementPath(previous, diceTotal);
-      if (passedStart) {
-        logs = addLog(logs, `${activePlayer.name} collected ${formatFunds(PASS_START_BONUS)} at City Gate.`);
-      }
-
-      activePlayer.position = nextPosition;
-      const tile = getActiveTile(activePlayer);
-
-      if (PURCHASABLE_TYPES.has(tile.type)) {
-        const tileState = propertyState[tile.id];
-        if (tileState && !tileState.ownerId) {
-          pendingAction = {
-            type: "purchase",
-            tileId: tile.id,
-            playerId: activePlayer.id,
-            price: tile.price ?? 0,
-          };
-          pendingNextTurnIndex = stayOnCurrentPlayer ? currentIndex : (currentIndex + 1) % players.length;
-          logs = addLog(logs, `${tile.name} is available for ${formatFunds(tile.price ?? 0)}.`);
-        } else if (tileState && tileState.ownerId && tileState.ownerId !== activePlayer.id) {
-          if (!tileState.mortgaged) {
-            const rent = calculateRent(tile, diceTotal, propertyState, tileState.ownerId);
-            const owner = players.find((player) => player.id === tileState.ownerId);
-            if (owner) {
-              logs = addLog(
-                logs,
-                `${activePlayer.name} owes ${formatFunds(rent)} to ${owner.name}.`,
-              );
-            }
-            const payment = payAmount(players, propertyState, activePlayer.id, tileState.ownerId, rent, logs);
-            players = payment.players;
-            propertyState = payment.propertyState;
-            logs = payment.logs;
-            if (payment.removedIndex !== null) {
-              if (payment.removedIndex < currentIndex) {
-                currentIndex -= 1;
-              } else if (payment.removedIndex === currentIndex) {
-                const nextIndex = players.length > 0 ? currentIndex % players.length : 0;
-                return {
-                  ...state,
-                  players,
-                  propertyState,
-                  logs,
-                  lastRoll: [dieA, dieB],
-                  currentTurnIndex: nextIndex,
-                  consecutiveDoubles: 0,
-                  pendingAction: null,
-                  pendingNextTurnIndex: null,
-                  lastCard: null,
-                };
-              }
-            }
-          } else {
-            logs = addLog(logs, `${tile.name} is mortgaged. No rent due.`);
-          }
-        }
-      } else {
-        switch (tile.type) {
-          case "tax": {
-            const fee = tile.price ?? 100;
-            logs = addLog(logs, `${activePlayer.name} paid ${formatFunds(fee)} in zoning fees.`);
-            const payment = payAmount(players, propertyState, activePlayer.id, null, fee, logs);
-            players = payment.players;
-            propertyState = payment.propertyState;
-            logs = payment.logs;
-            if (payment.removedIndex !== null) {
-              if (payment.removedIndex < currentIndex) {
-                currentIndex -= 1;
-              } else if (payment.removedIndex === currentIndex) {
-                const nextIndex = players.length > 0 ? currentIndex % players.length : 0;
-                return {
-                  ...state,
-                  players,
-                  propertyState,
-                  logs,
-                  lastRoll: [dieA, dieB],
-                  currentTurnIndex: nextIndex,
-                  consecutiveDoubles: 0,
-                  pendingAction: null,
-                  pendingNextTurnIndex: null,
-                  lastCard: null,
-                };
-              }
-            }
-            break;
-          }
-          case "chance": {
-          const card = CHANCE_CARDS[chanceIndex % CHANCE_CARDS.length];
-          chanceIndex = (chanceIndex + 1) % CHANCE_CARDS.length;
-          const result = handleChanceOrChest(card, activePlayer, players, propertyState, logs);
-          players = result.players;
-          propertyState = result.propertyState;
-          logs = result.logs;
-          lastCard = { type: "chance", title: card.title, description: card.description };
-          playSound("card");
-          if (result.followUpPosition !== null) {
-            activePlayer.position = result.followUpPosition;
-          }
-          movementPath = result.movementPath;
-          break;
-        }
-        case "chest": {
-          const card = CHEST_CARDS[chestIndex % CHEST_CARDS.length];
-          chestIndex = (chestIndex + 1) % CHEST_CARDS.length;
-          const result = handleChanceOrChest(card, activePlayer, players, propertyState, logs);
-          players = result.players;
-          propertyState = result.propertyState;
-          logs = result.logs;
-          lastCard = { type: "chest", title: card.title, description: card.description };
-          playSound("card");
-          if (result.followUpPosition !== null) {
-            activePlayer.position = result.followUpPosition;
-          }
-          movementPath = result.movementPath;
-          break;
-        }
-        case "gotojail":
-          sendPlayerToJail(activePlayer);
-          logs = addLog(logs, `${activePlayer.name} was redirected to city hall.`);
-          stayOnCurrentPlayer = false;
-          consecutiveDoubles = 0;
-          movementPath = [];
-          break;
-        default:
-          break;
-      }
-      }
-
-      const remainingPlayers = players.length;
-      let nextIndex = remainingPlayers > 0 ? (currentIndex + 1) % remainingPlayers : 0;
-      if (stayOnCurrentPlayer && remainingPlayers > 0) {
-        nextIndex = currentIndex % remainingPlayers;
-      }
-
-      if (pendingAction) {
-        return {
-          ...state,
-          players,
-          propertyState,
-          logs,
-          pendingAction,
-          pendingNextTurnIndex,
-          lastRoll: [dieA, dieB],
-          consecutiveDoubles,
-          lastMovementPath: movementPath,
-          lastCard,
-          chanceIndex,
-          chestIndex,
-        };
-      }
-
-      if (!stayOnCurrentPlayer) {
-        consecutiveDoubles = 0;
-      }
-
-      const nextPhase = players.length <= 1 ? "summary" : state.phase;
-
-      return {
-        ...state,
-        players,
-        propertyState,
-        logs,
-        pendingAction: null,
-        pendingNextTurnIndex: null,
-        lastRoll: [dieA, dieB],
-        consecutiveDoubles,
-        currentTurnIndex: nextIndex,
-        lastCard,
-        chanceIndex,
-        chestIndex,
-        phase: nextPhase,
-        lastMovementPath: movementPath,
-      };
+      return doRollInternal(state, dieA, dieB);
+    });
+  },
+  // dev helper: deterministic roll
+  // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+  // @ts-ignore
+  rollDiceAndResolveFixed: (a: number, b: number) => {
+    set((state) => {
+      if (state.phase !== "rolling" || state.players.length === 0 || state.pendingAction) return state;
+      return doRollInternal(state, a, b);
     });
   },
   confirmPurchase: () => {
@@ -917,7 +684,13 @@ export const useGameStore = create<GameState>((set) => ({
 
       const buyer = players[buyerIndex];
       if (buyer.funds < state.pendingAction.price) {
-        const nextLogs = addLog(logs, `${buyer.name} cannot afford ${tile.name}.`);
+        const nextLogs = addLog(
+          logs,
+          i18n.t("logs.cannot_afford", {
+            name: buyer.name,
+            tile: i18n.t(`tiles.${tile.id}`, { defaultValue: tile.name }),
+          }),
+        );
         const nextIndex = state.pendingNextTurnIndex ?? ((state.currentTurnIndex + 1) % players.length);
         return {
           ...state,
@@ -936,7 +709,14 @@ export const useGameStore = create<GameState>((set) => ({
         propertyMeta.ownerId = buyer.id;
       }
 
-      const nextLogs = addLog(logs, `${buyer.name} purchased ${tile.name} for ${formatFunds(state.pendingAction.price)}.`);
+  const nextLogs = addLog(
+    logs,
+    i18n.t("logs.purchased", {
+      name: buyer.name,
+      tile: i18n.t(`tiles.${tile.id}`, { defaultValue: tile.name }),
+      price: formatFunds(state.pendingAction.price),
+    }),
+  );
       const nextIndex = state.pendingNextTurnIndex ?? ((state.currentTurnIndex + 1) % players.length);
       const samePlayerContinues = nextIndex === state.currentTurnIndex;
 
@@ -967,7 +747,7 @@ export const useGameStore = create<GameState>((set) => ({
         pendingNextTurnIndex: null,
         currentTurnIndex: nextIndex,
         consecutiveDoubles: samePlayerContinues ? state.consecutiveDoubles : 0,
-        logs: addLog(state.logs, `Purchase opportunity declined.`),
+        logs: addLog(state.logs, i18n.t("logs.purchase_declined")),
       };
     });
   },
@@ -1034,7 +814,7 @@ export const useGameStore = create<GameState>((set) => ({
 
       const upgrader = players[playerIndex];
       if (upgrader.funds < state.pendingAction.price) {
-        const nextLogs = addLog(state.logs, `${upgrader.name} cannot afford the upgrade.`);
+        const nextLogs = addLog(state.logs, i18n.t("logs.cannot_afford_upgrade", { name: upgrader.name }));
         return {
           ...state,
           players,
@@ -1049,7 +829,11 @@ export const useGameStore = create<GameState>((set) => ({
 
       const nextLogs = addLog(
         state.logs,
-        `${upgrader.name} upgraded ${tile.name} to level ${state.pendingAction.nextLevel}.`,
+        i18n.t("logs.upgraded", {
+          name: upgrader.name,
+          tile: i18n.t(`tiles.${tile.id}`, { defaultValue: tile.name }),
+          level: state.pendingAction.nextLevel,
+        }),
       );
 
       return {
@@ -1087,7 +871,11 @@ export const useGameStore = create<GameState>((set) => ({
       const propertyState = clonePropertyState(state.propertyState);
       propertyState[tileId].mortgaged = true;
 
-      const logs = addLog(state.logs, `${activePlayer.name} mortgaged ${tile.name} for ${formatFunds(value)}.`);
+      const logs = addLog(state.logs, i18n.t("logs.mortgaged", {
+        name: activePlayer.name,
+        tile: i18n.t(`tiles.${tile.id}`, { defaultValue: tile.name }),
+        value: formatFunds(value),
+      }));
 
       return {
         ...state,
@@ -1115,11 +903,49 @@ export const useGameStore = create<GameState>((set) => ({
       const propertyState = clonePropertyState(state.propertyState);
       propertyState[tileId].mortgaged = false;
 
-      const logs = addLog(state.logs, `${activePlayer.name} redeemed ${tile.name} for ${formatFunds(cost)}.`);
+      const logs = addLog(state.logs, i18n.t("logs.redeemed", {
+        name: activePlayer.name,
+        tile: i18n.t(`tiles.${tile.id}`, { defaultValue: tile.name }),
+        value: formatFunds(cost),
+      }));
 
       return {
         ...state,
         players,
+        propertyState,
+        logs,
+      };
+    });
+  },
+  // claim a single property from another player as a pledge (transfer ownership to active player)
+  claimPledgeFrom: (fromPlayerId: string, tileId: string) => {
+    set((state) => {
+      const activePlayer = state.players[state.currentTurnIndex];
+      if (!activePlayer) return state;
+      if (activePlayer.id === fromPlayerId) return state;
+
+      const tile = BOARD_TILES.find((t) => t.id === tileId);
+      if (!tile) return state;
+
+      const propertyState = clonePropertyState(state.propertyState);
+      const meta = propertyState[tileId];
+      if (!meta || meta.ownerId !== fromPlayerId) return state;
+
+      // transfer ownership to active player
+      meta.ownerId = activePlayer.id;
+
+      const fromPlayer = state.players.find((p) => p.id === fromPlayerId);
+      const logs = addLog(
+        state.logs,
+        i18n.t("logs.received_pledge", {
+          name: activePlayer.name,
+          tile: i18n.t(`tiles.${tile.id}`, { defaultValue: tile.name }),
+          from: fromPlayer?.name ?? "Player",
+        }),
+      );
+
+      return {
+        ...state,
         propertyState,
         logs,
       };
@@ -1251,9 +1077,7 @@ export const useGameStore = create<GameState>((set) => ({
       const trade = state.pendingTrade;
       if (!trade) return state;
 
-      const initiator = initiatorId
-        ? state.players.find((player) => player.id === initiatorId)
-        : null;
+      const initiator = initiatorId ? state.players.find((player) => player.id === initiatorId) : null;
       const fromPlayer = state.players.find((player) => player.id === trade.fromId);
       const toPlayer = state.players.find((player) => player.id === trade.toId);
 
@@ -1275,8 +1099,64 @@ export const useGameStore = create<GameState>((set) => ({
   },
   placeAuctionBid: () => {},
   closeAuction: () => {},
-  leaveJailByPayment: () => {},
-  useJailCard: () => {},
+  leaveJailByPayment: (playerId: string) => {
+    set((state) => {
+      const players = state.players.map((p) => ({ ...p }));
+      const propertyState = clonePropertyState(state.propertyState);
+      const playerIndex = players.findIndex((p) => p.id === playerId);
+      if (playerIndex === -1) return state;
+      const player = players[playerIndex];
+      if (!player.inJail) return state;
+
+      // Pay 200 to leave jail
+      const result = payAmount(players, propertyState, player.id, null, 200, state.logs);
+      const nextPlayers = result.players;
+      const nextPropertyState = result.propertyState;
+      let logs = result.logs;
+
+      if (result.bankruptPlayerId === player.id) {
+        // player went bankrupt while trying to pay
+        const nextIndex = nextPlayers.length > 0 ? (state.currentTurnIndex % nextPlayers.length) : 0;
+        return {
+          ...state,
+          players: nextPlayers,
+          propertyState: nextPropertyState,
+          logs,
+          currentTurnIndex: nextIndex,
+        };
+      }
+
+      const holder = nextPlayers.find((p) => p.id === player.id);
+      if (holder) {
+        holder.inJail = false;
+        holder.jailTurns = 0;
+      }
+      logs = addLog(logs, `${player.name} paid ${formatFunds(200)} to exit city hall.`);
+
+      return {
+        ...state,
+        players: nextPlayers,
+        propertyState: nextPropertyState,
+        logs,
+      };
+    });
+  },
+  useJailCard: (playerId: string) => {
+    set((state) => {
+      const players = state.players.map((p) => ({ ...p }));
+      const idx = players.findIndex((p) => p.id === playerId);
+      if (idx === -1) return state;
+      const player = players[idx];
+      if (!player.inJail) return state;
+      if (!player.hasGetOutOfJail) return state;
+
+      player.hasGetOutOfJail = false;
+      player.inJail = false;
+      player.jailTurns = 0;
+      const logs = addLog(state.logs, `${player.name} used a release permit to exit city hall.`);
+      return { ...state, players, logs };
+    });
+  },
   dismissCard: () => set(() => ({ lastCard: null })),
   reset: () =>
     set(() => ({
@@ -1296,5 +1176,304 @@ export const useGameStore = create<GameState>((set) => ({
       pendingTrade: null,
       auction: null,
       lastMovementPath: [],
+      winnerId: null,
     })),
 }));
+// internal helper that executes roll logic and returns a partial new state
+const doRollInternal = (state: GameState, dieA: number, dieB: number): Partial<GameState> => {
+  const diceTotal = dieA + dieB;
+
+  let players = state.players.map((player) => ({ ...player }));
+  let propertyState = clonePropertyState(state.propertyState);
+  let logs = state.logs;
+  let movementPath: number[] = [];
+
+  let currentIndex = state.currentTurnIndex;
+  if (currentIndex >= players.length) currentIndex = 0;
+  let activePlayer = players[currentIndex];
+  let pendingAction: PendingAction = null;
+  let pendingNextTurnIndex: number | null = null;
+  let consecutiveDoubles = dieA === dieB ? state.consecutiveDoubles + 1 : 0;
+  let stayOnCurrentPlayer = dieA === dieB;
+  let lastCard: CardSnapshot | null = null;
+  let chanceIndex = state.chanceIndex;
+  let chestIndex = state.chestIndex;
+
+  logs = addLog(logs, i18n.t("logs.roll", { name: activePlayer.name, a: dieA, b: dieB }));
+  // DEV: add debugging context to help trace turn/movement issues
+  if (import.meta.env.DEV) {
+    logs = addLog(logs, `DEBUG: activePlayerId=${activePlayer.id} currentIndex=${currentIndex}`);
+  }
+
+  if (dieA === dieB && consecutiveDoubles >= 3) {
+    sendPlayerToJail(activePlayer);
+    logs = addLog(logs, `${activePlayer.name} rolled three doubles in a row and was audited.`);
+    consecutiveDoubles = 0;
+    stayOnCurrentPlayer = false;
+    const nextIndex = players.length > 0 ? (currentIndex + 1) % players.length : 0;
+    const winnerId = computeWinnerId(players);
+    return {
+      players,
+      propertyState,
+      lastRoll: [dieA, dieB],
+      logs,
+      currentTurnIndex: nextIndex,
+      consecutiveDoubles,
+      pendingAction: null,
+      pendingNextTurnIndex: null,
+      lastCard: null,
+      lastMovementPath: [],
+      winnerId,
+    };
+  }
+
+  const jailResult = resolveJailState(activePlayer, dieA, dieB, players, propertyState, logs);
+  players = jailResult.players;
+  propertyState = jailResult.propertyState;
+  logs = jailResult.logs;
+
+      if (jailResult.removedIndex !== null) {
+        if (jailResult.removedIndex < currentIndex) {
+          currentIndex -= 1;
+        } else if (jailResult.removedIndex === currentIndex) {
+          const nextIndex = players.length > 0 ? currentIndex % players.length : 0;
+          const winnerId = computeWinnerId(players);
+          return {
+            players,
+            propertyState,
+            logs,
+            lastRoll: [dieA, dieB],
+            currentTurnIndex: nextIndex,
+            consecutiveDoubles: 0,
+            pendingAction: null,
+            pendingNextTurnIndex: null,
+            lastCard: null,
+            lastMovementPath: [],
+            winnerId,
+          };
+        }
+      }
+
+  if (!jailResult.canMove) {
+    const nextIndex = players.length > 0 ? (currentIndex + 1) % players.length : 0;
+    const winnerId = computeWinnerId(players);
+    return {
+      players,
+      propertyState,
+      logs,
+      lastRoll: [dieA, dieB],
+      currentTurnIndex: nextIndex,
+      consecutiveDoubles: 0,
+      pendingAction: null,
+      pendingNextTurnIndex: null,
+      lastCard: null,
+      lastMovementPath: [],
+      winnerId,
+    };
+  }
+
+  activePlayer = players[currentIndex];
+
+  const previous = activePlayer.position;
+  const nextPosition = normalizePosition(previous + diceTotal);
+  const passedStart = applyPassStartBonus(activePlayer, previous, nextPosition, diceTotal > 0);
+  movementPath = computeMovementPath(previous, diceTotal);
+  if (passedStart) {
+    logs = addLog(logs, i18n.t("logs.collected_start", { name: activePlayer.name, amount: formatFunds(PASS_START_BONUS) }));
+  }
+
+  activePlayer.position = nextPosition;
+  if (import.meta.env.DEV) {
+    logs = addLog(logs, `DEBUG MOVE: ${activePlayer.name} (${activePlayer.id}) ${previous} -> ${nextPosition}`);
+  }
+  const tile = getActiveTile(activePlayer);
+
+  if (PURCHASABLE_TYPES.has(tile.type)) {
+    const tileState = propertyState[tile.id];
+    if (tileState && !tileState.ownerId) {
+      pendingAction = {
+        type: "purchase",
+        tileId: tile.id,
+        playerId: activePlayer.id,
+        price: tile.price ?? 0,
+      };
+      pendingNextTurnIndex = stayOnCurrentPlayer ? currentIndex : (currentIndex + 1) % players.length;
+      logs = addLog(logs, `${i18n.t(`tiles.${tile.id}`, { defaultValue: tile.name })} is available for ${formatFunds(tile.price ?? 0)}.`);
+    } else if (tileState && tileState.ownerId && tileState.ownerId !== activePlayer.id) {
+      if (!tileState.mortgaged) {
+        const rent = calculateRent(tile, diceTotal, propertyState, tileState.ownerId);
+        const owner = players.find((player) => player.id === tileState.ownerId);
+              if (owner) {
+                logs = addLog(logs, i18n.t("logs.owes_rent", { payer: activePlayer.name, amount: formatFunds(rent), owner: owner.name }));
+              }
+        const payment = payAmount(players, propertyState, activePlayer.id, tileState.ownerId, rent, logs);
+        players = payment.players;
+        propertyState = payment.propertyState;
+        logs = payment.logs;
+          if (payment.removedIndex !== null) {
+            if (payment.removedIndex < currentIndex) {
+              currentIndex -= 1;
+            } else if (payment.removedIndex === currentIndex) {
+              const nextIndex = players.length > 0 ? currentIndex % players.length : 0;
+              const winnerId = computeWinnerId(players);
+              return {
+                players,
+                propertyState,
+                logs,
+                lastRoll: [dieA, dieB],
+                currentTurnIndex: nextIndex,
+                consecutiveDoubles: 0,
+                pendingAction: null,
+                pendingNextTurnIndex: null,
+                lastCard: null,
+                lastMovementPath: [],
+                winnerId,
+              };
+            }
+          }
+        } else {
+        logs = addLog(logs, `${i18n.t(`tiles.${tile.id}`, { defaultValue: tile.name })} is mortgaged. No rent due.`);
+      }
+    }
+  } else {
+    switch (tile.type) {
+      case "tax": {
+        const fee = tile.price ?? 100;
+        logs = addLog(logs, `${activePlayer.name} paid ${formatFunds(fee)} in zoning fees.`);
+        const payment = payAmount(players, propertyState, activePlayer.id, null, fee, logs);
+        players = payment.players;
+        propertyState = payment.propertyState;
+        logs = payment.logs;
+        if (payment.removedIndex !== null) {
+          if (payment.removedIndex < currentIndex) {
+            currentIndex -= 1;
+          } else if (payment.removedIndex === currentIndex) {
+            const nextIndex = players.length > 0 ? currentIndex % players.length : 0;
+            const winnerId = computeWinnerId(players);
+            return {
+              players,
+              propertyState,
+              logs,
+              lastRoll: [dieA, dieB],
+              currentTurnIndex: nextIndex,
+              consecutiveDoubles: 0,
+              pendingAction: null,
+              pendingNextTurnIndex: null,
+              lastCard: null,
+              lastMovementPath: [],
+              winnerId,
+            };
+          }
+        }
+        break;
+      }
+      case "chance": {
+        const card = CHANCE_CARDS[chanceIndex % CHANCE_CARDS.length];
+        chanceIndex = (chanceIndex + 1) % CHANCE_CARDS.length;
+        const result = handleChanceOrChest(card, activePlayer, players, propertyState, logs);
+        players = result.players;
+        propertyState = result.propertyState;
+        logs = result.logs;
+        lastCard = {
+          type: "chance",
+          title: i18n.t(`cards.chance.${card.id}.title`, { defaultValue: card.title }),
+          description: i18n.t(`cards.chance.${card.id}.description`, { defaultValue: card.description }),
+        };
+        playSound("card");
+        if (result.followUpPosition !== null) {
+          activePlayer.position = result.followUpPosition;
+        }
+        // Only replace movementPath when the card caused movement; otherwise keep dice movement
+        if (result.movementPath && result.movementPath.length > 0) {
+          movementPath = [...movementPath, ...result.movementPath];
+        }
+        break;
+      }
+      case "chest": {
+        const card = CHEST_CARDS[chestIndex % CHEST_CARDS.length];
+        chestIndex = (chestIndex + 1) % CHEST_CARDS.length;
+        const result = handleChanceOrChest(card, activePlayer, players, propertyState, logs);
+        players = result.players;
+        propertyState = result.propertyState;
+        logs = result.logs;
+        lastCard = {
+          type: "chest",
+          title: i18n.t(`cards.chest.${card.id}.title`, { defaultValue: card.title }),
+          description: i18n.t(`cards.chest.${card.id}.description`, { defaultValue: card.description }),
+        };
+        playSound("card");
+        if (result.followUpPosition !== null) {
+          activePlayer.position = result.followUpPosition;
+        }
+        if (result.movementPath && result.movementPath.length > 0) {
+          movementPath = [...movementPath, ...result.movementPath];
+        }
+        break;
+      }
+      case "gotojail": {
+        const jailPath = computeForwardPath(activePlayer.position, JAIL_INDEX);
+        sendPlayerToJail(activePlayer);
+        logs = addLog(logs, `${activePlayer.name} was redirected to city hall.`);
+        stayOnCurrentPlayer = false;
+        consecutiveDoubles = 0;
+        movementPath = [...movementPath, ...jailPath];
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  const remainingPlayers = players.length;
+  let nextIndex = remainingPlayers > 0 ? (currentIndex + 1) % remainingPlayers : 0;
+  if (stayOnCurrentPlayer && remainingPlayers > 0) {
+    nextIndex = currentIndex % remainingPlayers;
+  }
+
+  if (pendingAction) {
+    // collapse consecutive duplicates (preserve movement order)
+    const uniquePath = collapseConsecutiveDuplicates(movementPath);
+    const winnerId = computeWinnerId(players);
+    return {
+      players,
+      propertyState,
+      logs,
+      pendingAction,
+      pendingNextTurnIndex,
+      lastRoll: [dieA, dieB],
+      consecutiveDoubles,
+      lastMovementPath: uniquePath,
+      lastCard,
+      chanceIndex,
+      chestIndex,
+      winnerId,
+    };
+  }
+
+  // If the player does not continue (no doubles), reset consecutive doubles.
+  if (!stayOnCurrentPlayer) {
+    consecutiveDoubles = 0;
+  }
+
+  const nextPhase = players.length <= 1 ? "summary" : state.phase;
+
+  // Final cleanup: collapse consecutive duplicate positions (preserve order)
+  const finalPath = collapseConsecutiveDuplicates(movementPath);
+  const winnerId = computeWinnerId(players);
+  return {
+    players,
+    propertyState,
+    logs,
+    pendingAction: null,
+    pendingNextTurnIndex: null,
+    lastRoll: [dieA, dieB],
+    consecutiveDoubles,
+    currentTurnIndex: nextIndex,
+    lastCard,
+    chanceIndex,
+    chestIndex,
+    phase: nextPhase,
+    lastMovementPath: finalPath,
+    winnerId,
+  };
+};
